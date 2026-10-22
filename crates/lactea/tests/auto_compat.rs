@@ -568,3 +568,61 @@ fn a_milkdrop2_milkdrop3_soft_cut_blends_across_the_mode_change() {
         panic!("wgpu validation error: {err}");
     }
 }
+
+/// The audio analysis is per-leg: during a cross-mode soft cut the outgoing preset keeps reading
+/// the regime it was authored against, and the incoming preset reads its own — the analyzers are
+/// permanently live and never swapped or reset by a mode change. Silent PCM makes the regimes
+/// distinguishable: MilkDrop 3's silence publishes `bass = 1.0`, BeatDrop's publishes `0.0`.
+#[test]
+fn a_cross_mode_soft_cut_keeps_each_legs_own_analysis() {
+    let mut rig = rig!(cfg(Compat::MilkDrop2, false));
+    let soft = Transition::Soft { seconds: 0.5 };
+
+    // MilkDrop 3 active (its q40 preset loads under Compat::MilkDrop3): silent PCM, so its
+    // regime's bands publish the silence value 1.0.
+    rig.engine
+        .load_preset_as_compat(q40(0.0, 1.0, 0.0).as_bytes(), "a.milk", soft, Compat::MilkDrop3)
+        .unwrap();
+    rig.run(3);
+    let bass = |vars: Vec<(String, f64)>| {
+        vars.into_iter()
+            .find(|(n, _)| n == "audio.bass")
+            .map(|(_, v)| v)
+            .expect("audio.bass")
+    };
+    assert!(
+        (bass(rig.engine.frame_vars()) - 1.0).abs() < 1e-4,
+        "MD3 silence publishes 1.0"
+    );
+
+    // Soft-load a MilkDrop 2 preset (BeatDrop): the blend must keep the outgoing leg on its
+    // authored 1.0 while the incoming BeatDrop leg reads 0.0.
+    rig.engine
+        .load_preset_as_compat(plain(1.0, 0.0, 0.0).as_bytes(), "b.milk", soft, Compat::MilkDrop2)
+        .unwrap();
+    assert_eq!(rig.engine.active_preset_name(), Some("a.milk"));
+    rig.run(3);
+    let (active, incoming) = (
+        bass(rig.engine.frame_vars()),
+        bass(rig.engine.incoming_frame_vars()),
+    );
+    assert!(
+        (active - 1.0).abs() < 1e-4,
+        "the outgoing MD3 leg keeps its own regime's analysis (got {active})"
+    );
+    assert!(
+        incoming.abs() < 1e-4,
+        "the incoming MD2 leg reads BeatDrop (got {incoming})"
+    );
+
+    // Near the end of the fade the outgoing leg still publishes its authored regime.
+    rig.run(20);
+    let (active, incoming) = (
+        bass(rig.engine.frame_vars()),
+        bass(rig.engine.incoming_frame_vars()),
+    );
+    assert!(
+        (active - 1.0).abs() < 1e-4 && incoming.abs() < 1e-4,
+        "held to the end of the fade: active {active}, incoming {incoming}"
+    );
+}

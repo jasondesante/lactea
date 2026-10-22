@@ -2,7 +2,7 @@
 
 use crate::cache::{MediaCache, ShaderCache};
 use crate::md2_inputs::{Md2Frame, Md2Inputs, Md2Vars};
-use crate::md3_inputs::{Md3Frame, Md3Inputs, MouseState, new_analyzer, shader_ext, state_q64};
+use crate::md3_inputs::{Analyzers, Md3Frame, Md3Inputs, MouseState, shader_ext, state_q64};
 use crate::media::Media;
 use crate::rng::{ShaderStream, StreamRng, hue_offsets};
 use crate::runtime::{
@@ -15,7 +15,7 @@ use crate::{
     ShaderOutcome, ShaderOverride, Transition, TransitionInfo,
 };
 use lactea_abi::{PassKind, ShaderInterface, TexSource};
-use lactea_audio::{Analyzer, AudioFrame};
+use lactea_audio::AudioFrame;
 use lactea_eel::GlobalMemory;
 use lactea_hlsl::{Options as HlslOptions, default_comp_shader, default_warp_shader};
 use lactea_preset::milk2::is_double_preset;
@@ -149,7 +149,6 @@ struct Slot {
 /// What [`Engine::enter_compat`] replaced, to put back when the load that triggered the switch fails.
 struct CompatUndo {
     compat: Compat,
-    analyzer: Analyzer,
     rng_owner: GlobalMemory,
 }
 
@@ -234,7 +233,9 @@ pub struct Engine {
     cfg: EngineConfig,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    analyzer: Analyzer,
+    /// One permanently-live analyzer per analysis mode; every mode's analysis advances every
+    /// frame, and each render leg reads the regime its preset was authored against.
+    analyzers: Analyzers,
     provider: Option<Box<dyn TextureProvider>>,
     /// Textures and sprites the provider decoded, kept across preset loads (cleared with the provider).
     media_cache: MediaCache,
@@ -326,7 +327,7 @@ impl Engine {
         let rng_owner = GlobalMemory::with_dialect(eel_dialect(&cfg.compat.rules()));
         rng_owner.set_rng_seed(eel_seed(cfg.seed));
         Ok(Self {
-            analyzer: new_analyzer(&cfg),
+            analyzers: Analyzers::new(&cfg),
             device: device.clone(),
             queue: queue.clone(),
             provider: None,
@@ -411,9 +412,14 @@ impl Engine {
         self.incoming.as_ref().map(|s| &s.renderer)
     }
 
-    /// The audio analysis of the last rendered frame.
+    /// The audio analysis of the last rendered frame, of the regime the active preset was
+    /// authored against (the engine's mode before the first load).
     pub fn audio_frame(&self) -> &AudioFrame {
-        self.analyzer.frame()
+        let compat = self
+            .active
+            .as_ref()
+            .map_or(self.cfg.compat, |s| s.renderer.compat());
+        self.analyzers.frame(compat)
     }
 
     /// Name given to the last successfully loaded preset (the incoming one during a soft cut).
@@ -492,10 +498,10 @@ impl Engine {
 
     /// Interleaved float PCM (`-1..1`), any channel count (only the first two are used).
     pub fn push_pcm_f32(&mut self, interleaved: &[f32], channels: usize) {
-        self.analyzer.push_pcm_f32(interleaved, channels);
-        if self.cfg.compat.rules().md2_shader_inputs {
-            self.md2_in.push_pcm(interleaved, channels);
-        }
+        self.analyzers.push_pcm_f32(interleaved, channels);
+        // BeatDrop's shader-FFT history stays warm in every mode, so `sampler_fft` /
+        // `sampler_wave` are live the moment an MD2 preset appears (mid-fade included).
+        self.md2_in.push_pcm(interleaved, channels);
     }
 
     /// The mouse for the following frames (see [`MouseState`]). The engine samples it once per rendered frame;
@@ -513,7 +519,7 @@ impl Engine {
             return;
         }
         self.cfg.volume_sensitivity = sensitivity;
-        self.analyzer.set_volume_sensitivity(sensitivity);
+        self.analyzers.set_volume_sensitivity(sensitivity);
     }
 
     /// Every renderer the engine owns (active, incoming, idle spare).
@@ -726,19 +732,18 @@ impl Engine {
         result
     }
 
-    /// Switch the engine's mode-dependent state to `compat`: the analysis mode of the audio, the EEL dialect (a fresh
+    /// Switch the engine's mode-dependent state to `compat`: the EEL dialect (a fresh
     /// `reg00..reg99` / `gmegabuf`, one `rand()` stream throughout) and the mode every renderer built from now on
-    /// follows ([`Engine::acquire_renderer`]). Returns what [`Engine::leave_compat`] needs to undo it.
+    /// follows ([`Engine::acquire_renderer`]). The audio analyzers are not part of the switch — one per regime is
+    /// permanently live, so a preset's analysis never resets mid-transition. Returns what
+    /// [`Engine::leave_compat`] needs to undo it.
     fn enter_compat(&mut self, compat: Compat) -> CompatUndo {
         let previous = self.cfg.compat;
         self.cfg.compat = compat;
-        let mut analyzer = new_analyzer(&self.cfg);
-        analyzer.take_pcm_from(&self.analyzer);
         let owner =
             GlobalMemory::sharing_rng_with_dialect(&self.rng_owner, eel_dialect(&compat.rules()));
         CompatUndo {
             compat: previous,
-            analyzer: std::mem::replace(&mut self.analyzer, analyzer),
             rng_owner: std::mem::replace(&mut self.rng_owner, owner),
         }
     }
@@ -746,7 +751,6 @@ impl Engine {
     /// Undo [`Engine::enter_compat`] after a failed load: the running preset keeps its mode.
     fn leave_compat(&mut self, undo: CompatUndo) {
         self.cfg.compat = undo.compat;
-        self.analyzer = undo.analyzer;
         self.rng_owner = undo.rng_owner;
         // a failed load hands its renderer back to the spare slot, built for the mode that failed
         if let Some(r) = self.spare.as_mut().filter(|r| r.compat() != undo.compat) {
@@ -1496,13 +1500,28 @@ impl Engine {
         let dt = self.last_time.map_or(0.0, |t| (clock.time - t).max(0.0));
         self.last_time = Some(clock.time);
         self.last_frame_no = clock.frame;
-        self.analyzer.update_dt(dt);
+        self.analyzers.update_dt(dt);
         let forced = self.forced.take();
         let forced_incoming = self.forced_incoming.take();
         let forced_blend = self.forced_blend.take();
+        // Each slot reads the frame of the regime its preset was authored against; teacher
+        // forcing overrides that slot's regime frame.
+        let active_compat = self
+            .active
+            .as_ref()
+            .map_or(self.cfg.compat, |s| s.renderer.compat());
+        let incoming_compat = self.incoming.as_ref().map(|s| s.renderer.compat());
         // only a teacher-forced frame needs its own copy of the analysis
         let forced_audio = forced.as_ref().map(|f| {
-            let mut a = self.analyzer.frame().clone();
+            let mut a = self.analyzers.frame(active_compat).clone();
+            f.override_audio(&mut a);
+            a
+        });
+        let forced_incoming_audio = forced_incoming.as_ref().map(|f| {
+            let mut a = self
+                .analyzers
+                .frame(incoming_compat.unwrap_or(active_compat))
+                .clone();
             f.override_audio(&mut a);
             a
         });
@@ -1560,7 +1579,8 @@ impl Engine {
         }
         let user_draws = match self.active {
             Some(_) => {
-                let a = self.analyzer.frame();
+                // sprites burn into the active preset's image: the active regime's frame
+                let a = self.analyzers.frame(active_compat);
                 let blend_progress = self.transition.as_ref().map_or_else(
                     || {
                         self.md2
@@ -1588,60 +1608,82 @@ impl Engine {
             None => Vec::new(),
         };
 
-        let audio: &AudioFrame = forced_audio
+        // Per-leg analysis: each leg reads its authored regime's frame; the engine-mode frame
+        // (with teacher forcing standing in for it, as before) drives that mode's host-input
+        // samplers, and the other mode's samplers stay live on their own regime's frame.
+        let engine_audio: &AudioFrame = forced_audio
             .as_ref()
-            .unwrap_or_else(|| self.analyzer.frame());
+            .unwrap_or_else(|| self.analyzers.frame(self.cfg.compat));
+        let md3_audio = if self.cfg.compat == Compat::MilkDrop3 {
+            engine_audio
+        } else {
+            self.analyzers.frame(Compat::MilkDrop3)
+        };
+        let md2_audio = if self.cfg.compat == Compat::MilkDrop2 {
+            engine_audio
+        } else {
+            self.analyzers.frame(Compat::MilkDrop2)
+        };
+        // Each `begin_frame` owns once-per-frame state (the mouse release/click edge, the shader
+        // FFT smoothers' single step): called exactly once, shared by both legs; per-leg gating
+        // happens at the `prepare_slot` / `attach` sites below.
+        let md3_rules = Compat::MilkDrop3.rules();
         let mut md3 = self.md3.begin_frame(
-            &self.cfg.compat.rules(),
-            audio,
+            &md3_rules,
+            md3_audio,
             self.cfg.fps as f32,
             clock.time as f32,
         );
         // BeatDrop's host inputs (MilkDrop 2): the mouse / keys / clock for the expressions and `_c14.._c16`, and
         // one step of the shader FFT with the active state's `FFTAttack` / `FFTDecay` (blended while a soft cut runs)
-        let rules = self.cfg.compat.rules();
-        let md2f = (rules.md2_input_vars || rules.md2_shader_inputs).then(|| {
+        let md2f = {
             let fft = self.active.as_mut().map_or((0.5, 0.7), |a| {
                 a.loaded
                     .floats
                     .fft_params(&a.loaded.preset.base, clock.time as f32)
             });
-            self.md2_in.begin_frame(
-                audio,
-                self.cfg.fps as f32,
-                clock.time,
-                fft,
-                rules.md2_shader_inputs,
-            )
+            self.md2_in.begin_frame(md2_audio, self.cfg.fps as f32, clock.time, fft, true)
+        };
+        let inc_audio: &AudioFrame = forced_incoming_audio.as_ref().unwrap_or_else(|| {
+            self.analyzers
+                .frame(incoming_compat.unwrap_or(active_compat))
         });
+        let act_audio: &AudioFrame = forced_audio
+            .as_ref()
+            .unwrap_or_else(|| self.analyzers.frame(active_compat));
 
-        // The incoming preset renders first (its image only), then the active one.
+        // The incoming preset renders first (its image only), then the active one. A cross-mode soft cut is the one
+        // way an incoming slot exists (same-mode soft cuts are in-pipeline blends): each leg is gated by its own
+        // renderer's compat, so an outgoing MD3 preset keeps `sampler_fft` / `_mxd3q*` during an MD3→MD2 fade and an
+        // outgoing MD2 preset keeps `_c14.._c16` / `mouse` during an MD2→MD3 fade.
+        let mut md3_stepped = false;
         if let Some(inc) = self.incoming.as_mut().filter(|_| blending) {
-            // A cross-mode soft cut is the one way an incoming slot exists under MilkDrop 3 (its own soft cuts are
-            // MilkDrop 2 blends inside one pipeline): the active preset belongs to the old mode and reads none of
-            // the mode's shader inputs, so the `_mxd3q*` block steps here, for the incoming state.
-            if let Some(frame) = md3.as_mut() {
+            let inc_rules = inc.renderer.compat().rules();
+            let inc_wants_md3 =
+                inc_rules.md3_extended_vars || inc_rules.md3_shader_fft || inc_rules.md3_shader_time;
+            let inc_wants_md2 = inc_rules.md2_input_vars || inc_rules.md2_shader_inputs;
+            // `_mxd3q*` steps for the incoming state here (its per-frame code has not run yet — the shipped
+            // one-frame-of-lag semantics), but only when the incoming leg is the MD3 one.
+            if inc_wants_md3
+                && let Some(frame) = md3.as_mut()
+            {
                 self.md3.step_mxd3q(frame, state_q64(&inc.loaded.pf));
+                md3_stepped = true;
             }
             let mut fi = prepare_slot(
                 inc,
                 &self.cfg,
                 clock,
                 progress,
-                audio,
+                inc_audio,
                 forced_incoming.as_ref(),
                 None,
-                md2f.as_ref(),
+                if inc_wants_md2 { Some(&md2f) } else { None },
             );
-            if let Some(frame) = md3.as_ref() {
-                attach_md3_ext(
-                    &mut fi,
-                    &self.cfg.compat.rules(),
-                    frame,
-                    inc,
-                    None,
-                    clock.time,
-                );
+            if inc_wants_md3
+                && let Some(frame) = md3.as_ref()
+            {
+                attach_md3_ext(&mut fi, &inc_rules, frame, inc, None, clock.time);
             }
             // during a soft cut the sprites go over the blend (below), not into each preset's own image
             let _ = inc.renderer.render_frame_to_output(encoder, &fi);
@@ -1650,31 +1692,44 @@ impl Engine {
         let cfg = &self.cfg;
         match self.active.as_mut() {
             Some(act) => {
+                let act_rules = act.renderer.compat().rules();
+                let act_wants_md3 = act_rules.md3_extended_vars
+                    || act_rules.md3_shader_fft
+                    || act_rules.md3_shader_time;
+                let act_wants_md2 = act_rules.md2_input_vars || act_rules.md2_shader_inputs;
                 let mut fi = prepare_slot(
                     act,
                     cfg,
                     clock,
                     progress,
-                    audio,
+                    act_audio,
                     forced.as_ref(),
                     self.md2.as_mut(),
-                    md2f.as_ref(),
+                    if act_wants_md2 { Some(&md2f) } else { None },
                 );
                 // MilkDrop 3 runs the `_mxd3q*` block at the end of `RunPerFrameEquations`, after the per-frame code
                 // of the state it treats as current (`m_pState` = `active`; a blend's old state is `md2`) and reads
                 // that state's `q64`. It steps here, once per frame, before any shader input that carries its output
-                // is built — with an incoming slot (a cross-mode soft cut) it already stepped there, and the active
-                // preset of the old mode reads none of it.
-                if let Some(frame) = md3.as_mut().filter(|_| !blending) {
-                    self.md3.step_mxd3q(frame, state_q64(&act.loaded.pf));
-                    attach_md3_ext(
-                        &mut fi,
-                        &cfg.compat.rules(),
-                        frame,
-                        act,
-                        self.md2.as_ref(),
-                        clock.time,
-                    );
+                // is built — only while an MD3 preset is on screen: an incoming MD3 leg already stepped (its
+                // per-frame code has not run yet — the shipped one-frame-of-lag), so the step lands on the active
+                // leg only when it is the MD3 one, mid-fade included (an outgoing MD3 preset keeps its `_mxd3q*`
+                // during an MD3→MD2 fade; in a pure MD2 session the block stays frozen, as shipped).
+                if act_wants_md3 {
+                    if let Some(frame) = md3.as_mut()
+                        && !md3_stepped
+                    {
+                        self.md3.step_mxd3q(frame, state_q64(&act.loaded.pf));
+                    }
+                    if let Some(frame) = md3.as_ref() {
+                        attach_md3_ext(
+                            &mut fi,
+                            &act_rules,
+                            frame,
+                            act,
+                            self.md2.as_ref(),
+                            clock.time,
+                        );
+                    }
                 }
                 if !blending {
                     fi.sprites.extend(user_draws.iter().cloned());

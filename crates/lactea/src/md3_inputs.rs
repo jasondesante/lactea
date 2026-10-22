@@ -181,18 +181,65 @@ impl Md3Inputs {
     }
 }
 
-/// The audio analyzer of an engine: MilkDrop 3's under `CompatRules::md3_audio_analysis` (with the configured
-/// `VolumeSensitivity`), BeatDrop's under `Compat::MilkDrop2` (Hz-defined bands — what MilkDrop 2-era presets were
-/// authored against; projectM's fixed thirds flatten their bass response), otherwise the projectM one.
-pub(crate) fn new_analyzer(cfg: &EngineConfig) -> Analyzer {
-    if cfg.compat.rules().md3_audio_analysis {
-        let mut a = Analyzer::with_mode(cfg.sample_rate, AnalysisMode::Md3);
-        a.set_volume_sensitivity(cfg.volume_sensitivity);
-        a
-    } else if cfg.compat == Compat::MilkDrop2 {
-        Analyzer::with_mode(cfg.sample_rate, AnalysisMode::BeatDrop)
-    } else {
-        Analyzer::new(cfg.sample_rate)
+/// The audio analyzers of an engine — one per [`AnalysisMode`], permanently live. All three are fed the same PCM and
+/// advanced with the same `dt` every rendered frame, so a preset's analysis is never swapped or reset mid-transition:
+/// a cross-mode soft cut renders each leg with the frame of the regime that leg's preset was authored against
+/// (BeatDrop's Hz bands for MilkDrop 2-era presets — what they were authored against; MilkDrop 3's capture, with the
+/// configured `VolumeSensitivity`, for MD3 presets; projectM's fixed thirds otherwise).
+pub(crate) struct Analyzers {
+    projectm: Analyzer,
+    beatdrop: Analyzer,
+    md3: Analyzer,
+}
+
+impl Analyzers {
+    pub(crate) fn new(cfg: &EngineConfig) -> Self {
+        let mut md3 = Analyzer::with_mode(cfg.sample_rate, AnalysisMode::Md3);
+        md3.set_volume_sensitivity(cfg.volume_sensitivity);
+        Analyzers {
+            projectm: Analyzer::new(cfg.sample_rate),
+            beatdrop: Analyzer::with_mode(cfg.sample_rate, AnalysisMode::BeatDrop),
+            md3,
+        }
+    }
+
+    /// The latest frame of the regime `compat` presets were authored against.
+    pub(crate) fn frame(&self, compat: Compat) -> &AudioFrame {
+        match compat {
+            Compat::MilkDrop3 => self.md3.frame(),
+            Compat::MilkDrop2 => self.beatdrop.frame(),
+            Compat::ProjectM => self.projectm.frame(),
+        }
+    }
+
+    /// Advance every regime's analysis over the same frame duration.
+    pub(crate) fn update_dt(&mut self, dt: f64) {
+        for a in [&mut self.projectm, &mut self.beatdrop, &mut self.md3] {
+            a.update_dt(dt);
+        }
+    }
+
+    pub(crate) fn push_pcm_f32(&mut self, interleaved: &[f32], channels: usize) {
+        for a in [&mut self.projectm, &mut self.beatdrop, &mut self.md3] {
+            a.push_pcm_f32(interleaved, channels);
+        }
+    }
+
+    pub(crate) fn push_pcm_i16(&mut self, interleaved: &[i16], channels: usize) {
+        for a in [&mut self.projectm, &mut self.beatdrop, &mut self.md3] {
+            a.push_pcm_i16(interleaved, channels);
+        }
+    }
+
+    pub(crate) fn push_pcm_u8(&mut self, interleaved: &[u8], channels: usize) {
+        for a in [&mut self.projectm, &mut self.beatdrop, &mut self.md3] {
+            a.push_pcm_u8(interleaved, channels);
+        }
+    }
+
+    /// MilkDrop 3's `VolumeSensitivity` gain (ignored by the other regimes).
+    pub(crate) fn set_volume_sensitivity(&mut self, s: f32) {
+        self.md3.set_volume_sensitivity(s);
     }
 }
 

@@ -32,6 +32,10 @@ pub const MAX_SAMPLES: usize = WAVE_BUF;
 pub const WAVE_VALID: usize = 480;
 /// Spectrum bins per channel.
 pub const SPECTRUM_BINS: usize = 512;
+/// Sample frames per channel of BeatDrop's FFT window (`2 * SPECTRUM_BINS`); the analyzer keeps
+/// this many real samples per channel so the window covers a whole render gap instead of being
+/// zero-padded from the 576 ring.
+pub const BEATDROP_WINDOW: usize = 2 * SPECTRUM_BINS;
 /// float PCM (-1..1) is scaled by this to MD2's 8-bit-like range (-128..127).
 pub const PCM_SCALE: f32 = 128.0;
 
@@ -42,8 +46,8 @@ pub enum AnalysisMode {
     /// Bit-for-bit intent: projectM `Audio/PCM.cpp` + `Loudness.cpp` + `MilkdropFFT.cpp`.
     ProjectM,
     /// BeatDrop's vis_milk2 fork (`plugin.cpp::DoCustomSoundAnalysis`):
-    /// Hz-defined bands, 1024-point zero-padded window, silence -> 0 (not 1), `fps`-based
-    /// rate adjustment.
+    /// Hz-defined bands, 1024-point window (the newest [`BEATDROP_WINDOW`] real samples),
+    /// silence -> 0 (not 1), `fps`-based rate adjustment.
     BeatDrop,
     /// MilkDrop 3 3.37 (`Compat::MilkDrop3`; docs/audio.md, "MilkDrop 3 mode"): the PCM is
     /// quantised to signed 8 bit when pushed, scaled by
@@ -129,6 +133,11 @@ pub struct Analyzer {
     sample_rate: u32,
     ring: [[f32; WAVE_BUF]; 2],
     start: usize,
+    /// Newest [`BEATDROP_WINDOW`] sample frames per channel ([`AnalysisMode::BeatDrop`]'s FFT
+    /// window), ring starting at `hist_head` (the oldest kept sample). Written on every push,
+    /// read only by the BeatDrop branch of [`Analyzer::update_dt`].
+    hist: [[f32; BEATDROP_WINDOW]; 2],
+    hist_head: usize,
     fft: Fft,
     align: [Aligner; 2],
     bands: [Band; 3],
@@ -185,6 +194,8 @@ impl Analyzer {
             sample_rate,
             ring: [[0.0; WAVE_BUF]; 2],
             start: 0,
+            hist: [[0.0; BEATDROP_WINDOW]; 2],
+            hist_head: 0,
             fft,
             align: [Aligner::new(), Aligner::new()],
             bands: [band; 3],
@@ -206,6 +217,8 @@ impl Analyzer {
     pub fn take_pcm_from(&mut self, prev: &Analyzer) {
         self.ring = prev.ring;
         self.start = prev.start;
+        self.hist = prev.hist;
+        self.hist_head = prev.hist_head;
     }
 
     /// Frames analysed so far (the `frame` counter used by the long-average switch at 50).
@@ -236,9 +249,10 @@ impl Analyzer {
 
     /// Append interleaved float PCM (-1..1) (`projectm_pcm_add_float`).  Channel 0 is left,
     /// channel 1 right, further channels are ignored; mono is duplicated to both.  Only the most
-    /// recent 576 sample frames matter (circular buffer), so pushing more than that per call is
-    /// fine.  `channels == 0` or a slice shorter than one frame is a no-op; a trailing partial
-    /// frame is ignored.
+    /// recent 576 sample frames feed the waveform ring, and the most recent
+    /// [`BEATDROP_WINDOW`] feed BeatDrop's analysis window (both circular), so pushing more than
+    /// that per call is fine.  `channels == 0` or a slice shorter than one frame is a no-op; a
+    /// trailing partial frame is ignored.
     ///
     /// In [`AnalysisMode::Md3`] every sample is quantised to signed 8 bit on the way in
     /// (`s >= 1.0 -> 127`, `s < -1.0 -> -128`, otherwise `trunc(128 * s)`).
@@ -286,17 +300,30 @@ impl Analyzer {
                 0.0
             }
         };
+        // BeatDrop's 1024-sample FFT history: duplicated from the same converted values the ring
+        // stores, so its window covers a whole render gap with real samples. Mode-gated to keep
+        // Md3's quantised values out of a history nobody reads.
+        let keep_hist = self.mode == AnalysisMode::BeatDrop;
         for i in 0..count {
             let off = (self.start + i) % WAVE_BUF;
             let l = conv(interleaved[i * channels]);
-            self.ring[0][off] = l;
-            self.ring[1][off] = if channels > 1 {
+            let r = if channels > 1 {
                 conv(interleaved[i * channels + 1])
             } else {
                 l
             };
+            self.ring[0][off] = l;
+            self.ring[1][off] = r;
+            if keep_hist {
+                let h = (self.hist_head + i) % BEATDROP_WINDOW;
+                self.hist[0][h] = l;
+                self.hist[1][h] = r;
+            }
         }
         self.start = (self.start + count) % WAVE_BUF;
+        if keep_hist {
+            self.hist_head = (self.hist_head + count) % BEATDROP_WINDOW;
+        }
     }
 
     /// Analyse the current ring contents for a frame lasting `1/fps` seconds (`fps` must be
@@ -329,7 +356,7 @@ impl Analyzer {
         }
         // 2. spectra (Md3: of the aligned waveform; the other modes: of the unaligned one)
         let mut spec = [[0.0f32; SPECTRUM_BINS]; 2];
-        for (w, s) in wave.iter().zip(spec.iter_mut()) {
+        for ((ch, w), s) in wave.iter().enumerate().zip(spec.iter_mut()) {
             match self.mode {
                 AnalysisMode::ProjectM => {
                     // damp the FFT input: average with the previous sample
@@ -342,9 +369,13 @@ impl Analyzer {
                     self.fft.time_to_frequency_domain(&damped, s);
                 }
                 AnalysisMode::BeatDrop => {
-                    // 576 samples zero-padded into the 1024 window
-                    let mut padded = [0.0f32; 2 * SPECTRUM_BINS];
-                    padded[..WAVE_BUF].copy_from_slice(w);
+                    // BeatDrop's window: the newest 1024 REAL samples, oldest first — the FFT is
+                    // constructed for 1024 inputs, and zero-padding the 576 ring starved it of
+                    // the first half of every render gap (the reference analysis never truncates)
+                    let mut padded = [0.0f32; BEATDROP_WINDOW];
+                    let (tail, head) = self.hist[ch].split_at(self.hist_head);
+                    padded[..tail.len()].copy_from_slice(tail);
+                    padded[tail.len()..].copy_from_slice(head);
                     self.fft.time_to_frequency_domain(&padded, s);
                 }
                 AnalysisMode::Md3 => {

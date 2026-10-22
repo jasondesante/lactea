@@ -433,3 +433,35 @@ fn update_dt_zero_first_frame_leaves_averages_untouched() {
     let f = a.update_dt(0.0).clone();
     assert_eq!((f.bass, f.mid, f.treb), (1.0, 1.0, 1.0));
 }
+
+#[test]
+fn beatdrop_fft_window_is_the_newest_1024_real_samples() {
+    // A quarter-sample-rate tone (period 4 -> exactly bin 256 of the 1024-point transform) is
+    // pushed followed by silence, such that the 576 waveform ring holds only silence (the tone
+    // has scrolled out) while the 1024-sample analysis history still contains part of it. The
+    // spectrum must see the tone (the window covers the real stream, not a zero-padded ring
+    // snapshot), and the drawn wave path must stay untouched.
+    let total = 1200usize; // hist head lands at 176: the rotation copy is exercised too
+    let mut pcm = Vec::with_capacity(total * 2);
+    for i in 0..total {
+        let s = if i < 448 {
+            0.5 * (std::f32::consts::FRAC_PI_2 * i as f32).sin()
+        } else {
+            0.0
+        };
+        pcm.push(s);
+        pcm.push(s);
+    }
+    let mut a = Analyzer::with_mode(SR as u32, AnalysisMode::BeatDrop);
+    a.push_pcm_f32(&pcm, 2);
+    let f = a.update(60.0).clone();
+    let peak = (0..512)
+        .max_by(|&x, &y| f.spectrum[0][x].partial_cmp(&f.spectrum[0][y]).unwrap())
+        .unwrap();
+    assert_eq!(peak, 256, "quarter-rate tone -> bin 256; got {peak}");
+    assert!(f.spectrum[0][256] > 0.05, "bin 256 {}", f.spectrum[0][256]);
+    assert!(
+        f.wave[0][..480].iter().all(|&v| v == 0.0),
+        "the drawn wave ring saw only silence"
+    );
+}

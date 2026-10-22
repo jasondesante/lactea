@@ -27,12 +27,12 @@ impl Engine {
     /// `projectm_pcm_add_int16`: interleaved signed 16-bit PCM (full scale 32768), mono or
     /// stereo (more channels: only the first two are analysed).
     pub fn push_pcm_i16(&mut self, interleaved: &[i16], channels: usize) {
-        self.analyzer.push_pcm_i16(interleaved, channels);
+        self.analyzers.push_pcm_i16(interleaved, channels);
     }
 
     /// `projectm_pcm_add_uint8`: interleaved unsigned 8-bit PCM (silence = 128).
     pub fn push_pcm_u8(&mut self, interleaved: &[u8], channels: usize) {
-        self.analyzer.push_pcm_u8(interleaved, channels);
+        self.analyzers.push_pcm_u8(interleaved, channels);
     }
 
     /// `projectm_get_last_frame_time`: the `time` of the last rendered frame (0 before the first).
