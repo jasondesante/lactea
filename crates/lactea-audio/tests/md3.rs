@@ -743,15 +743,16 @@ fn md3_low_tone_after_a_high_tone_raises_bass_and_not_treb() {
 #[test]
 fn md3_loud_constant_level_hits_bass_only() {
     // A constant level (0 Hz) has no alignment shift and no quantisation noise: its energy sits
-    // in the lowest bins (bass), the other bands stay below the 0.001 long-average floor -> 1.0.
-    // After 60 silent frames (long average 0, frame >= 50 so rate 0.992 at 60 fps):
-    // long_avg_k = imm * (1 - r^(k+1)), bass_k = 1 / (1 - r^(k+1)), r = (0.992^30)^(1/60).
+    // in the lowest bins (bass); mid / treb hold the 1.0 floor while their long averages are
+    // under 0.001 and unpin afterwards into the same cold-start series as bass. The 60 silent
+    // frames don't age the analyzer (long average 0, frame 0, fast rate 0.9):
+    // long_avg_k = imm * (1 - r^(k+1)), bass_k = 1 / (1 - r^(k+1)), r = (0.9^30)^(1/60).
     let mut a = md3();
     for n in 0..60u64 {
         a.push_pcm_f32(&frame_pcm(n, 60, &|_, _| 0.0), 2);
         a.update(60.0);
     }
-    let r = 0.992f64.powf(0.5);
+    let r = 0.9f64.powf(0.5);
     let q = 0.2f64.powf(0.5);
     for k in 0..4 {
         a.push_pcm_f32(&vec![0.8; 2 * 735], 2);
@@ -762,7 +763,13 @@ fn md3_loud_constant_level_hits_bass_only() {
             "k={k}: bass {} vs {want}",
             f.bass
         );
-        assert_eq!((f.mid, f.treb), (1.0, 1.0), "k={k}");
+        assert!(
+            f.mid <= f.bass * 1.001 && f.treb <= f.bass * 1.001,
+            "k={k}: bass {} mid {} treb {}",
+            f.bass,
+            f.mid,
+            f.treb
+        );
         // the short average rises at rate 0.2 while imm > avg: avg_k = imm * (1 - q^(k+1))
         let want_att = (1.0 - q.powi(k + 1)) / (1.0 - r.powi(k + 1));
         assert!(

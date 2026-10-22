@@ -496,3 +496,29 @@ fn md3_hz_bands_move_the_band_edges() {
         balance((hz_bass, hz_mid)),
     );
 }
+
+/// Idling on silence must not age the analyzer: however long the host sat paused, the first
+/// live frame still gets the frame-0 fast warm-up value (`1/(1-0.9)`), not the slow-average
+/// regime's uniform full-band flash.
+#[test]
+fn silence_does_not_age_the_warmup_window() {
+    let mut a = Analyzer::new(SR as u32);
+    let silence = vec![0.0f32; 2 * 576];
+    for _ in 0..100 {
+        a.push_pcm_f32(&silence, 2);
+        a.update(30.0);
+    }
+    assert_eq!(a.frame_index(), 0);
+
+    let mut seed = 5;
+    let block: Vec<f32> = (0..576).map(|_| rng(&mut seed) * 0.3).collect();
+    let stereo: Vec<f32> = block.iter().flat_map(|&x| [x, x]).collect();
+    a.push_pcm_f32(&stereo, 2);
+    let f = a.update(30.0).clone();
+    let want = 1.0f32 / (1.0f32 - 0.9f32);
+    assert!(
+        (f.bass - want).abs() < 1e-3 * want,
+        "first live frame after 100 silent frames: {} vs {want}",
+        f.bass
+    );
+}

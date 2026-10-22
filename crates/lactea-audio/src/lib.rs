@@ -243,7 +243,8 @@ impl Analyzer {
         self.hist_head = prev.hist_head;
     }
 
-    /// Frames analysed so far (the `frame` counter used by the long-average switch at 50).
+    /// Live frames analysed so far — silent frames don't count (the `frame` counter used by the
+    /// long-average switch at 50).
     pub fn frame_index(&self) -> u32 {
         self.frame_no
     }
@@ -462,6 +463,12 @@ impl Analyzer {
             AnalysisMode::ProjectM | AnalysisMode::Md3 => 1.0f32,
             AnalysisMode::BeatDrop => 0.0f32,
         };
+        // A silent frame must not age the analyzer: a host idling on silence (paused player, or
+        // the visualizer open before playback at a sparse cadence) would otherwise burn the
+        // 50-frame fast warm-up window and leave the onset of music in the slow-average regime —
+        // a uniform full-band flash that takes seconds to settle instead of the reference's
+        // sub-second cold start. Same scale as the long-average silence clamp below.
+        let live = self.bands.iter().any(|b| b.imm.abs() > 0.001);
         for bd in &mut self.bands {
             let r = if bd.imm > bd.avg { 0.2f32 } else { 0.5f32 };
             let rate = adjust_rate(r, dt_f);
@@ -496,7 +503,10 @@ impl Analyzer {
         o.treb_att = self.bands[2].avg_rel;
         o.vol = (o.bass + o.mid + o.treb) * 0.333f32;
         o.vol_att = (o.bass_att + o.mid_att + o.treb_att) * 0.333f32;
-        self.frame_no = self.frame_no.saturating_add(1);
+        // silent frames don't count (see `live` above)
+        if live {
+            self.frame_no = self.frame_no.saturating_add(1);
+        }
         &self.out
     }
 }
