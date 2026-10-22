@@ -73,6 +73,7 @@ pub struct Lactea {
     config: wgpu::SurfaceConfiguration,
     engine: Engine,
     textures: TextureMap,
+    strong_md3_bands: bool,
 }
 
 #[wasm_bindgen]
@@ -182,6 +183,7 @@ impl Lactea {
             config,
             engine,
             textures,
+            strong_md3_bands: true,
         })
     }
 
@@ -266,6 +268,21 @@ impl Lactea {
     pub fn debug_audio(&self) -> Vec<f32> {
         let f = self.engine.audio_frame();
         vec![f.bass, f.mid, f.treb, f.bass_att, f.mid_att, f.treb_att]
+    }
+
+    /// Debug: `[strong_md3_bands, active_compat_tag, engine_compat_tag]` — what the feed log
+    /// needs to attribute a band reading to a regime. Tags: 0 projectM, 1 md2, 2 md3.
+    pub fn debug_flags(&self) -> Vec<f32> {
+        let tag = |c: Compat| match c {
+            Compat::ProjectM => 0.0,
+            Compat::MilkDrop2 => 1.0,
+            Compat::MilkDrop3 => 2.0,
+        };
+        vec![
+            if self.strong_md3_bands { 1.0 } else { 0.0 },
+            tag(self.engine.renderer().compat()),
+            tag(self.engine.current_compat()),
+        ]
     }
 
     /// Mouse position in `0..1` canvas coordinates (y down); `undefined` when outside.

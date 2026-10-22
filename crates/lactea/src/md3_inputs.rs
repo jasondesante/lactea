@@ -244,6 +244,32 @@ impl Analyzers {
     pub(crate) fn set_volume_sensitivity(&mut self, s: f32) {
         self.md3.set_volume_sensitivity(s);
     }
+
+    /// Whether the Md3 analyzer reads the Hz-band override.
+    #[cfg(test)]
+    pub(crate) fn md3_hz_bands(&self) -> bool {
+        self.md3.md3_hz_bands()
+    }
+}
+
+#[cfg(test)]
+mod strong_bands_tests {
+    use super::*;
+
+    /// `EngineConfig::strong_md3_bands` must actually reach the Md3 analyzer — the browser host
+    /// opts in, and a wiring regression here silently flattens every MD3 preset back to the
+    /// authored thirds.
+    #[test]
+    fn strong_md3_bands_config_reaches_the_analyzer() {
+        let mut cfg = EngineConfig::default();
+        cfg.compat = Compat::MilkDrop3;
+        cfg.sample_rate = 44_100;
+        let quiet = Analyzers::new(&cfg);
+        assert!(!quiet.md3_hz_bands(), "default: authored thirds");
+        cfg.strong_md3_bands = true;
+        let strong = Analyzers::new(&cfg);
+        assert!(strong.md3_hz_bands(), "opt-in: BeatDrop's Hz bands");
+    }
 }
 
 /// The MD3 shader inputs of one state's passes: its own `q33..q64` (read from `pf` after its per-frame code), the

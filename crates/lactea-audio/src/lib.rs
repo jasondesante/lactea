@@ -278,6 +278,11 @@ impl Analyzer {
         self.md3_hz_bands = on;
     }
 
+    /// Whether the Md3 Hz-band override is engaged (introspection for host diagnostics).
+    pub fn md3_hz_bands(&self) -> bool {
+        self.md3_hz_bands
+    }
+
     /// Append interleaved float PCM (-1..1) (`projectm_pcm_add_float`).  Channel 0 is left,
     /// channel 1 right, further channels are ignored; mono is duplicated to both.  Only the most
     /// recent 576 sample frames feed the waveform ring, and the most recent
