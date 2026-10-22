@@ -143,6 +143,13 @@ pub struct EngineConfig {
     /// audio analysis. Only [`Compat::MilkDrop3`] uses it (the other modes ignore it). Change it live with
     /// [`Engine::set_volume_sensitivity`].
     pub volume_sensitivity: f32,
+    /// Give the MilkDrop 3 audio analysis BeatDrop's Hz-defined bands (mono-averaged — a dedicated
+    /// 0-250 Hz kick channel) instead of MD3's authored fixed thirds, whose "bass" is dominated by
+    /// 1-4 kHz content and whose per-beat contrast is roughly half. The Md3 capture itself
+    /// (8-bit quantise, alignment, 576-sample window) is untouched; only the band edges move.
+    /// Default `false` (reference MD3 behaviour). Hosts that want MilkDrop-2-strength band
+    /// response from MD3 presets opt in.
+    pub strong_md3_bands: bool,
     /// MilkDrop 3 `BlendMilk2` (default on): transitions into and out of a `.milk2` double preset are soft. Off, every
     /// load of a `.milk2` and every change away from one is a hard cut. Only [`Compat::MilkDrop3`] reads it.
     pub blend_milk2: bool,
@@ -176,6 +183,7 @@ impl Default for EngineConfig {
             md3_disable_box: true,
             auto_hard_cut_mode: 0,
             volume_sensitivity: 1.0,
+            strong_md3_bands: false,
             blend_milk2: true,
             blend_time_user: 1.7,
             shader_overrides: HashMap::new(),

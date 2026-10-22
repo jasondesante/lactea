@@ -196,6 +196,9 @@ impl Analyzers {
     pub(crate) fn new(cfg: &EngineConfig) -> Self {
         let mut md3 = Analyzer::with_mode(cfg.sample_rate, AnalysisMode::Md3);
         md3.set_volume_sensitivity(cfg.volume_sensitivity);
+        if cfg.strong_md3_bands {
+            md3.set_md3_hz_bands(true);
+        }
         Analyzers {
             projectm: Analyzer::new(cfg.sample_rate),
             beatdrop: Analyzer::with_mode(cfg.sample_rate, AnalysisMode::BeatDrop),

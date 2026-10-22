@@ -162,6 +162,10 @@ impl Lactea {
             auto_compat: compat == "auto",
             output_format: format,
             sample_rate,
+            // browser host: MD3 presets read BeatDrop's kick-aware bands (MD3's authored thirds
+            // have half the per-beat contrast and a vocal-dominated "bass") — the capture itself
+            // stays reference
+            strong_md3_bands: true,
             ..Default::default()
         };
         let mut engine = Engine::new(&device, &queue, cfg).map_err(js_err)?;
@@ -255,6 +259,13 @@ impl Lactea {
     /// Feeds interleaved float PCM (`-1..1`) at the rate given to [`Lactea::create`].
     pub fn push_pcm(&mut self, interleaved: &[f32], channels: usize) {
         self.engine.push_pcm_f32(interleaved, channels.max(1));
+    }
+
+    /// Debug: the six band values of the last rendered frame, `[bass, mid, treb, bass_att,
+    /// mid_att, treb_att]`, from the regime the active preset was authored against.
+    pub fn debug_audio(&self) -> Vec<f32> {
+        let f = self.engine.audio_frame();
+        vec![f.bass, f.mid, f.treb, f.bass_att, f.mid_att, f.treb_att]
     }
 
     /// Mouse position in `0..1` canvas coordinates (y down); `undefined` when outside.

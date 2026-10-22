@@ -465,3 +465,34 @@ fn beatdrop_fft_window_is_the_newest_1024_real_samples() {
         "the drawn wave ring saw only silence"
     );
 }
+
+#[test]
+fn md3_hz_bands_move_the_band_edges() {
+    // Band rel values only differentiate once each band has a history (long_avg above the
+    // silence clamp), so warm with broadband noise, then hold a 2 kHz tone. It lives in the
+    // first third under MD3's authored thirds (which reaches ~3.66 kHz) and in BeatDrop's mid
+    // (250-4000 Hz); the opt-in flag must move the (mid - bass) balance. Fresh analyzers per
+    // arm: the band definitions define what long_avg accumulates.
+    fn arms(flag: bool) -> (f32, f32) {
+        let mut a = Analyzer::with_mode(SR as u32, AnalysisMode::Md3);
+        a.set_md3_hz_bands(flag);
+        // stateless hash noise — `run` needs a shared `Fn`
+        let noise = |i: u64, _: usize| {
+            let h = ((i as f32 * 12.9898).sin() * 43758.55).fract();
+            h * 2.0 - 1.0
+        };
+        run(&mut a, 0..30, 60, &noise);
+        let g = sine(2000.0, 0.5);
+        let f = run(&mut a, 30..40, 60, &g);
+        (f.bass, f.mid)
+    }
+    let (thirds_bass, thirds_mid) = arms(false);
+    let (hz_bass, hz_mid) = arms(true);
+    let balance = |(bass, mid): (f32, f32)| mid - bass;
+    assert!(
+        balance((hz_bass, hz_mid)) > balance((thirds_bass, thirds_mid)) + 0.5,
+        "Hz bands shift 2 kHz from bass toward mid: thirds {}, hz {}",
+        balance((thirds_bass, thirds_mid)),
+        balance((hz_bass, hz_mid)),
+    );
+}

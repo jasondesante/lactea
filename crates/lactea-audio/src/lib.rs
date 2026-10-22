@@ -61,6 +61,23 @@ pub enum AnalysisMode {
 /// BeatDrop band edges in Hz (`m_nBassStart..m_nTrebEnd` defaults).
 pub const BEATDROP_BANDS_HZ: [(i32, i32); 3] = [(0, 250), (250, 4000), (4000, 20000)];
 
+/// BeatDrop's Hz-defined band sums, mono-averaged: a dedicated 0-250 Hz kick channel instead of
+/// fixed spectrum thirds (whose "bass" is dominated by 1-4 kHz content).
+fn hz_band_sums(spec: &[[f32; SPECTRUM_BINS]; 2], sample_rate: u32) -> [f32; 3] {
+    let bin_size = (sample_rate as f32 / 2.0f32) / SPECTRUM_BINS as f32;
+    let mut out = [0.0f32; 3];
+    for ((fmin, fmax), band) in BEATDROP_BANDS_HZ.iter().zip(out.iter_mut()) {
+        let s = ((*fmin as f32 / bin_size) as i32).max(0);
+        let e = ((*fmax as f32 / bin_size) as i32).min(SPECTRUM_BINS as i32 - 1);
+        let mut sum = 0.0f32;
+        for j in s..=e {
+            sum += (spec[0][j as usize] + spec[1][j as usize]) / 2.0;
+        }
+        *band = sum;
+    }
+    out
+}
+
 /// Everything the renderer needs for one frame.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -143,6 +160,10 @@ pub struct Analyzer {
     bands: [Band; 3],
     frame_no: u32,
     volume_sensitivity: f32,
+    /// [`AnalysisMode::Md3`] only: sum BeatDrop's Hz-defined bands (mono-averaged, kick-aware)
+    /// instead of MD3's authored fixed thirds of the left-channel spectrum. Everything else about
+    /// the Md3 regime (8-bit capture, alignment, 576-sample window) stays reference.
+    md3_hz_bands: bool,
     out: AudioFrame,
 }
 
@@ -201,6 +222,7 @@ impl Analyzer {
             bands: [band; 3],
             frame_no: 0,
             volume_sensitivity: 1.0,
+            md3_hz_bands: false,
             out,
         }
     }
@@ -245,6 +267,15 @@ impl Analyzer {
         if s.is_finite() {
             self.volume_sensitivity = s;
         }
+    }
+
+    /// Sum BeatDrop's Hz-defined bands (mono-averaged — a dedicated 0-250 Hz kick channel) for
+    /// [`AnalysisMode::Md3`] instead of MD3's authored fixed thirds, whose "bass" is dominated by
+    /// 1-4 kHz content and whose contrast is roughly half of BeatDrop's. The Md3 capture
+    /// (8-bit quantise, alignment, 576-sample window) is untouched — only where the band edges
+    /// sit. Ignored by the other modes (BeatDrop already analyses this way).
+    pub fn set_md3_hz_bands(&mut self, on: bool) {
+        self.md3_hz_bands = on;
     }
 
     /// Append interleaved float PCM (-1..1) (`projectm_pcm_add_float`).  Channel 0 is left,
@@ -399,23 +430,25 @@ impl Analyzer {
                 }
             }
             AnalysisMode::BeatDrop => {
-                let bin_size = (self.sample_rate as f32 / 2.0f32) / SPECTRUM_BINS as f32;
-                for (b, (fmin, fmax)) in BEATDROP_BANDS_HZ.iter().enumerate() {
-                    let s = ((*fmin as f32 / bin_size) as i32).max(0);
-                    let e = ((*fmax as f32 / bin_size) as i32).min(SPECTRUM_BINS as i32 - 1);
-                    let mut sum = 0.0f32;
-                    for j in s..=e {
-                        sum += (spec[0][j as usize] + spec[1][j as usize]) / 2.0;
-                    }
-                    self.bands[b].imm = sum;
+                let sums = hz_band_sums(&spec, self.sample_rate);
+                for (band, imm) in self.bands.iter_mut().zip(sums) {
+                    band.imm = imm;
                 }
             }
             AnalysisMode::Md3 => {
-                // left channel only, plain sum of the bins of each third of the lower half
-                for (b, band) in self.bands.iter_mut().enumerate() {
-                    let start = SPECTRUM_BINS * b / 6;
-                    let end = SPECTRUM_BINS * (b + 1) / 6;
-                    band.imm = spec[0][start..end].iter().fold(0.0f32, |sum, &m| sum + m);
+                if self.md3_hz_bands {
+                    // BeatDrop's kick-aware bands over the Md3 capture (the host opted in)
+                    let sums = hz_band_sums(&spec, self.sample_rate);
+                    for (band, imm) in self.bands.iter_mut().zip(sums) {
+                        band.imm = imm;
+                    }
+                } else {
+                    // left channel only, plain sum of the bins of each third of the lower half
+                    for (b, band) in self.bands.iter_mut().enumerate() {
+                        let start = SPECTRUM_BINS * b / 6;
+                        let end = SPECTRUM_BINS * (b + 1) / 6;
+                        band.imm = spec[0][start..end].iter().fold(0.0f32, |sum, &m| sum + m);
+                    }
                 }
             }
         }
