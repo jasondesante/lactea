@@ -1,0 +1,29 @@
+[package]
+name = "lactea-ape"
+description = "wasm-bindgen host for the lactea engine embedded in ApeTapes (fork of examples/web)."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Not a member of the repository workspace, same as examples/web: the app build
+# must not need the wasm toolchain, and this crate carries its own lock file.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+name = "lactea_ape"
+
+[dependencies]
+lactea = { path = "../../crates/lactea" }
+# image decoding (PNG / JPEG / TGA / BMP) for textures handed over by the page
+lactea-host = { path = "../../crates/lactea-host" }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "webgpu"] }
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas", "console"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

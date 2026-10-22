@@ -448,7 +448,6 @@ fn a_projectm_compile_error_falls_back_to_milkdrop2() {
     let r = rig.load(&text, "s.milk", Transition::Soft { seconds: 1.0 });
     assert_eq!(r.compat, Compat::MilkDrop2);
     assert_eq!(rig.engine.current_compat(), Compat::MilkDrop2);
-    assert_eq!(rig.engine.renderer().compat(), Compat::MilkDrop2);
     assert!(
         r.warnings
             .iter()
@@ -456,9 +455,16 @@ fn a_projectm_compile_error_falls_back_to_milkdrop2() {
         "{:?}",
         r.warnings
     );
-    // a hard cut (the mode changed from MilkDrop 3), and the preset renders
-    assert!(rig.engine.transition_info().is_none());
-    assert!(near(px(&rig.run(2), 32, 24), GREEN));
+    // the mode changed from MilkDrop 3: the soft cut becomes the image-space transition, the
+    // incoming renderer is the MilkDrop 2 one while the outgoing preset keeps drawing
+    assert!(rig.engine.transition_info().is_some());
+    assert_eq!(
+        rig.engine.incoming_renderer().map(|r| r.compat()),
+        Some(Compat::MilkDrop2)
+    );
+    assert!(near(px(&rig.run(2), 32, 24), RED));
+    rig.run(95);
+    assert!(near(px(&rig.run(1), 32, 24), GREEN));
 
     // the next plain preset goes back to projectM
     let r = rig.load(&plain(0.0, 0.0, 1.0), "p.milk", Transition::Cut);
@@ -483,4 +489,82 @@ fn a_preset_both_modes_reject_reports_the_projectm_error_and_keeps_the_mode() {
     assert_eq!(rig.engine.active_preset_name(), Some("a.milk"));
     assert_eq!(rig.engine.renderer().compat(), Compat::ProjectM);
     assert!(near(px(&rig.run(2), 32, 24), GREEN));
+}
+
+#[test]
+fn a_milkdrop2_milkdrop3_soft_cut_blends_across_the_mode_change() {
+    let mut rig = rig!(cfg(Compat::MilkDrop2, false));
+    let (device, _) = GPU.clone().unwrap();
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let soft = Transition::Soft { seconds: 0.5 };
+
+    // MilkDrop 2 red with nothing running: the soft request is a cut
+    let r = rig
+        .engine
+        .load_preset_as_compat(
+            plain(1.0, 0.0, 0.0).as_bytes(),
+            "a.milk",
+            soft,
+            Compat::MilkDrop2,
+        )
+        .unwrap();
+    assert_eq!(r.compat, Compat::MilkDrop2);
+    assert!(near(px(&rig.run(3), 32, 24), RED));
+
+    // MilkDrop 3 green: the mode changes, the soft cut becomes the image-space transition of the
+    // two renderers
+    let r = rig
+        .engine
+        .load_preset_as_compat(
+            q40(0.0, 1.0, 0.0).as_bytes(),
+            "b.milk",
+            soft,
+            Compat::MilkDrop3,
+        )
+        .unwrap();
+    assert_eq!(r.compat, Compat::MilkDrop3);
+    assert_eq!(rig.engine.current_compat(), Compat::MilkDrop3);
+    assert_eq!(rig.engine.active_preset_name(), Some("a.milk"));
+    assert_eq!(rig.engine.renderer().compat(), Compat::MilkDrop2);
+    assert_eq!(
+        rig.engine.incoming_renderer().map(|r| r.compat()),
+        Some(Compat::MilkDrop3)
+    );
+    assert!(rig.engine.transition_info().is_some());
+    assert!(rig.engine.transition_progress().is_some());
+    // the outgoing preset still fills the first transition frames
+    assert!(near(px(&rig.run(2), 32, 24), RED));
+    rig.run(40);
+    assert!(near(px(&rig.run(1), 32, 24), GREEN));
+    assert!(rig.engine.transition_progress().is_none());
+    assert_eq!(rig.engine.renderer().compat(), Compat::MilkDrop3);
+
+    // and back: MilkDrop 2 blue over the MilkDrop 3 preset
+    let r = rig
+        .engine
+        .load_preset_as_compat(
+            plain(0.0, 0.0, 1.0).as_bytes(),
+            "c.milk",
+            soft,
+            Compat::MilkDrop2,
+        )
+        .unwrap();
+    assert_eq!(r.compat, Compat::MilkDrop2);
+    assert!(rig.engine.transition_progress().is_some());
+    rig.run(45);
+    assert!(near(px(&rig.run(1), 32, 24), BLUE));
+
+    // a `.milk2` double preset still enters through its own machinery: a hard cut
+    let pair = milk2(&plain(1.0, 0.0, 0.0), &plain(0.0, 1.0, 0.0));
+    let r = rig
+        .engine
+        .load_preset_as_compat(pair.as_bytes(), "d.milk2", soft, Compat::MilkDrop3)
+        .unwrap();
+    assert_eq!(r.compat, Compat::MilkDrop3);
+    assert!(rig.engine.transition_info().is_none());
+    assert!(rig.engine.double_preset_info().is_some());
+
+    if let Some(err) = pollster::block_on(scope.pop()) {
+        panic!("wgpu validation error: {err}");
+    }
 }

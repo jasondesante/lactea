@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c71cb44e4b280f44d1edd6d8492e17803505e8f7fc3144a06f7778e89fd8f07f # shrinks to code = "(a + (a = 0));\n", seed = 0
+cc dd215831bf87f21287faa51a5124c9a7c1850b9ed7b2ea2f76a9e1b0c6df623a # shrinks to code = "(0) |= +1e300;\n", seed = 0

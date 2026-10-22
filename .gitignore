@@ -9,3 +9,4 @@
 __pycache__/
 /lactea-debug-*.png
 /examples/web/dist/
+/examples/ape-web/target/

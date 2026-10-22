@@ -255,8 +255,10 @@ typedef struct {
 // (MilkDrop 3 when it uses an MD3 feature: `.milk2`, sprite block, `q33`..`q64`, MD3-only shader
 // names, ...; otherwise projectM). MilkDrop 2 is only a fallback: a preset projectM rejects because its
 // code does not compile is retried once under MilkDrop 2 (`lactea_get_compat` then says so). A load that
-// changes the mode is a hard cut whatever the requested transition; `lactea_get_compat` reports the
-// mode in use. Before the first load the mode is projectM.
+// changes the mode cannot use the mode's own preset blend: between MilkDrop 2 and MilkDrop 3 a soft
+// request becomes the image-space transition of the two renderers, anything involving projectM is a
+// hard cut whatever the requested transition; `lactea_get_compat` reports the mode in use. Before the
+// first load the mode is projectM.
 #define LACTEA_COMPAT_AUTO 3
 
 // Use the default level ([`LACTEA_LOG_LEVEL_INFO`]).

@@ -34,7 +34,9 @@ lactea --dir /usr/share/projectM/presets        # engine, PipeWire monitor captu
 sprites, `get_fft`/`mouse`/`q33..q64`, ...), projectM otherwise; MilkDrop 2 is only a fallback: a preset projectM
 rejects because its code does not compile (the MD2 line glueing, `docs/md3.md`) is retried once under MilkDrop 2. When
 the resolved mode changes between two presets the engine rebuilds its
-mode-dependent state and does a **hard cut** whatever `--transition-duration` says. `.milk2` files are listed in
+mode-dependent state and loads with a **hard cut** — a soft request between MilkDrop 2 and MilkDrop 3 instead
+becomes the image-space transition between the two renderers (`docs/md3.md`, "Automatic compatibility").
+`.milk2` files are listed in
 `auto` as well as `milkdrop3`. `projectm`, `milkdrop2` and `milkdrop3` fix the mode for every preset (as before).
 The host follows the resolved mode after every successful load (`Visualizer::current_compat`): MD3 display-time
 randomisation, the F8 key, the window title and the log. `CompatArg::md3()` is true only for the fixed `milkdrop3`.

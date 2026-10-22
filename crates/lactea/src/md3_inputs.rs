@@ -7,6 +7,7 @@
 //! runs it at the end of `RunPerFrameEquations` and reads the current state's `q64` there, so the frame only captures
 //! its inputs and [`Md3Inputs::step_mxd3q`] steps it, once, after that state's per-frame code.
 
+use crate::Compat;
 use crate::EngineConfig;
 use crate::mxd3q::{Mxd3q, Mxd3qAudio, Mxd3qBlock};
 use crate::runtime::PerFrame;
@@ -181,12 +182,15 @@ impl Md3Inputs {
 }
 
 /// The audio analyzer of an engine: MilkDrop 3's under `CompatRules::md3_audio_analysis` (with the configured
-/// `VolumeSensitivity`), otherwise the projectM one.
+/// `VolumeSensitivity`), BeatDrop's under `Compat::MilkDrop2` (Hz-defined bands — what MilkDrop 2-era presets were
+/// authored against; projectM's fixed thirds flatten their bass response), otherwise the projectM one.
 pub(crate) fn new_analyzer(cfg: &EngineConfig) -> Analyzer {
     if cfg.compat.rules().md3_audio_analysis {
         let mut a = Analyzer::with_mode(cfg.sample_rate, AnalysisMode::Md3);
         a.set_volume_sensitivity(cfg.volume_sensitivity);
         a
+    } else if cfg.compat == Compat::MilkDrop2 {
+        Analyzer::with_mode(cfg.sample_rate, AnalysisMode::BeatDrop)
     } else {
         Analyzer::new(cfg.sample_rate)
     }

@@ -18,6 +18,7 @@ use lactea_abi::{PassKind, ShaderInterface, TexSource};
 use lactea_audio::{Analyzer, AudioFrame};
 use lactea_eel::GlobalMemory;
 use lactea_hlsl::{Options as HlslOptions, default_comp_shader, default_warp_shader};
+use lactea_preset::milk2::is_double_preset;
 use lactea_preset::{
     BaseValues, Flavor, MAX_CUSTOM_SHAPES, MAX_CUSTOM_WAVES, Preset, code_to_source,
 };
@@ -319,6 +320,9 @@ impl Engine {
             stroke: Default::default(),
         };
         let renderer = Renderer::new(device, queue, rc)?;
+        // the image-space transition pipeline is compiled here, at creation — on the web that is a
+        // one-time shader-compile stall that must not land on the first cross-mode soft cut
+        let blender = TransitionBlender::new(device, cfg.output_format);
         let rng_owner = GlobalMemory::with_dialect(eel_dialect(&cfg.compat.rules()));
         rng_owner.set_rng_seed(eel_seed(cfg.seed));
         Ok(Self {
@@ -331,7 +335,7 @@ impl Engine {
             active: None,
             incoming: None,
             spare: Some(renderer),
-            blender: None,
+            blender: Some(blender),
             transition: None,
             clock: PresetClock {
                 now: 0.0,
@@ -602,6 +606,31 @@ impl Engine {
         result
     }
 
+    /// [`Engine::load_preset`] with the compatibility mode forced for this load: the preset runs
+    /// under `compat` regardless of [`EngineConfig::auto_compat`]. A mode change cannot use the
+    /// mode's own preset blend (both presets would have to run inside one mode's pipeline), so
+    /// between the MilkDrop 2 / MilkDrop 3 modes a soft cut falls back to the image-space
+    /// transition of two renderers; every other mode change is a hard cut. A failed load keeps
+    /// the old mode and preset.
+    pub fn load_preset_as_compat(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        transition: Transition,
+        compat: Compat,
+    ) -> Result<PresetReport, EngineError> {
+        let result = self.load_preset_resolved(bytes, name, transition, Some(compat));
+        if let Err(e) = &result {
+            log::error!("preset '{name}' failed to load: {e}");
+            self.on_switch_failed
+                .fire(&crate::callbacks::SwitchFailure {
+                    name: name.to_string(),
+                    message: e.to_string(),
+                });
+        }
+        result
+    }
+
     fn load_preset_inner(
         &mut self,
         bytes: &[u8],
@@ -662,10 +691,14 @@ impl Engine {
         }
     }
 
-    /// [`Engine::load_preset`] once the compatibility mode is known (`None`: keep the current one). A different mode
-    /// replaces everything the engine derives from the mode and loads the preset with a hard cut: the running
-    /// preset's contexts, renderer rules and audio analysis belong to the old mode and cannot be blended into the
-    /// new one (`docs/md3.md`, "Automatic compatibility"). A failed load restores the old mode.
+    /// [`Engine::load_preset`] once the compatibility mode is known (`None`: keep the current one). A mode change
+    /// replaces everything the engine derives from the mode and cannot use the mode's own preset blend (the running
+    /// preset's contexts, renderer rules and audio analysis belong to the old mode, and the MD2 / MD3 blends run both
+    /// presets inside one mode's pipeline). Between the two MilkDrop modes a soft cut therefore falls back to the
+    /// image-space transition: each preset keeps its own renderer and a transition shader cross-fades the two
+    /// images (`docs/md3.md`, "Automatic compatibility"). Every other mode change loads with a hard cut, as does a
+    /// `.milk2` double preset (its own soft legs are in-pipeline too) and a soft request with nothing running. A
+    /// failed load restores the old mode.
     fn load_preset_resolved(
         &mut self,
         bytes: &[u8],
@@ -677,7 +710,16 @@ impl Engine {
             return self.load_preset_in_mode(bytes, name, transition);
         };
         let undo = self.enter_compat(want);
-        let result = self.load_preset_in_mode(bytes, name, Transition::Cut);
+        let cross_soft = matches!(transition, Transition::Soft { seconds } if seconds > 0.0)
+            && self.active.is_some()
+            && undo.compat.md2_family()
+            && want.md2_family()
+            && !is_double_preset(bytes);
+        let result = if cross_soft {
+            self.load_preset_cross_mode_soft(bytes, name, transition)
+        } else {
+            self.load_preset_in_mode(bytes, name, Transition::Cut)
+        };
         if result.is_err() {
             self.leave_compat(undo);
         }
@@ -752,6 +794,42 @@ impl Engine {
             transition
         };
         // every load builds into an idle renderer: the previous preset keeps drawing untouched
+        let mut renderer = self.acquire_renderer();
+        renderer.reset_images();
+        match self.build_loaded(bytes, name, &mut renderer, true) {
+            Ok((loaded, report)) => {
+                self.commit(
+                    Slot {
+                        renderer,
+                        loaded,
+                        last: LastFrame::default(),
+                    },
+                    transition,
+                );
+                Ok(report)
+            }
+            Err(e) => {
+                self.spare = Some(renderer);
+                Err(e)
+            }
+        }
+    }
+
+    /// The image-space soft cut across a MilkDrop 2 / MilkDrop 3 mode change: the incoming preset builds into a
+    /// fresh renderer of the new mode and a transition shader cross-fades the two renderers' images while both
+    /// keep drawing. The old mode's in-pipeline blend state cannot follow the switch and ends here; the
+    /// transition takes over from the frame it had reached.
+    fn load_preset_cross_mode_soft(
+        &mut self,
+        bytes: &[u8],
+        name: &str,
+        transition: Transition,
+    ) -> Result<PresetReport, EngineError> {
+        self.md2 = None;
+        self.double = None;
+        if let Some(a) = self.active.as_mut() {
+            a.renderer.set_old_shader_state(None);
+        }
         let mut renderer = self.acquire_renderer();
         renderer.reset_images();
         match self.build_loaded(bytes, name, &mut renderer, true) {
@@ -1539,10 +1617,13 @@ impl Engine {
 
         // The incoming preset renders first (its image only), then the active one.
         if let Some(inc) = self.incoming.as_mut().filter(|_| blending) {
-            // ProjectM's `incoming` slot never exists under MilkDrop 3: its soft cuts are MilkDrop 2 blends inside
-            // one pipeline (`md2_preset_blend`), so there are no MD3 shader inputs for it
-            debug_assert!(md3.is_none(), "an incoming slot under MilkDrop 3");
-            let fi = prepare_slot(
+            // A cross-mode soft cut is the one way an incoming slot exists under MilkDrop 3 (its own soft cuts are
+            // MilkDrop 2 blends inside one pipeline): the active preset belongs to the old mode and reads none of
+            // the mode's shader inputs, so the `_mxd3q*` block steps here, for the incoming state.
+            if let Some(frame) = md3.as_mut() {
+                self.md3.step_mxd3q(frame, state_q64(&inc.loaded.pf));
+            }
+            let mut fi = prepare_slot(
                 inc,
                 &self.cfg,
                 clock,
@@ -1550,8 +1631,18 @@ impl Engine {
                 audio,
                 forced_incoming.as_ref(),
                 None,
-                None,
+                md2f.as_ref(),
             );
+            if let Some(frame) = md3.as_ref() {
+                attach_md3_ext(
+                    &mut fi,
+                    &self.cfg.compat.rules(),
+                    frame,
+                    inc,
+                    None,
+                    clock.time,
+                );
+            }
             // during a soft cut the sprites go over the blend (below), not into each preset's own image
             let _ = inc.renderer.render_frame_to_output(encoder, &fi);
             inc.last.recycle(fi);
@@ -1572,8 +1663,9 @@ impl Engine {
                 // MilkDrop 3 runs the `_mxd3q*` block at the end of `RunPerFrameEquations`, after the per-frame code
                 // of the state it treats as current (`m_pState` = `active`; a blend's old state is `md2`) and reads
                 // that state's `q64`. It steps here, once per frame, before any shader input that carries its output
-                // is built.
-                if let Some(frame) = md3.as_mut() {
+                // is built — with an incoming slot (a cross-mode soft cut) it already stepped there, and the active
+                // preset of the old mode reads none of it.
+                if let Some(frame) = md3.as_mut().filter(|_| !blending) {
                     self.md3.step_mxd3q(frame, state_q64(&act.loaded.pf));
                     attach_md3_ext(
                         &mut fi,

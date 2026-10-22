@@ -137,7 +137,9 @@ milkdrop3` to run it as MD3.
 
 `load_preset` calls `compat_for_preset` first (`Engine::load_preset_resolved`). If the result equals the current
 mode, nothing changes: the load, soft cuts and `.milk2` playback are the mode's own. If it differs, the engine
-switches (`enter_compat`) and loads with a **hard cut**; a failed load puts everything back (`leave_compat`).
+switches (`enter_compat`) and loads with a **hard cut** — between MilkDrop 2 and MilkDrop 3 a soft request instead
+falls back to the image-space transition of the two renderers (below); a failed load puts everything back
+(`leave_compat`).
 What a switch replaces:
 
 | State | Rebuilt as |
@@ -156,14 +158,17 @@ Transitions:
 | projectM -> projectM | unchanged: projectM's image-space soft cut between two independently rendered presets |
 | MD3 -> MD3 (a `.milk`, a `.milk2`, either order) | unchanged: MD2-style blend with MD3's patterns, `.milk2` playback and deferral |
 | MD2 -> MD2 (a fixed engine) | unchanged: MD2's blend |
-| any change of mode | a hard cut, whatever transition was asked; the new preset still starts from the previous image unless `start_clean` |
+| MD2 -> MD3, MD3 -> MD2 (a soft request, the incoming preset not a `.milk2`) | the image-space transition between the two renderers, each keeping its own mode: the running preset keeps drawing until the transition ends, the incoming one builds into a fresh renderer of the new mode; a running in-pipeline blend ends at its current frame, the `.milk2` machinery of a double preset on screen ends with it. A cut request (and a `.milk2` incoming) stays a hard cut |
+| any other change of mode (projectM involved) | a hard cut, whatever transition was asked; the new preset still starts from the previous image unless `start_clean` |
 
-A mixed pair cannot use projectM's image-space blend: it needs both presets to keep rendering, but the running
-preset's contexts (dialect, `q33..q64`, `t9..t16`), its audio analysis, the renderer rules and the per-frame frame
-builder all follow the one engine-wide mode, and the audio analyser and the EEL memory are single objects. Making
-them per slot would touch every frame path for a transition that happens at most once per mode change. MD2 -> MD3
-would be the one pair a MD2-style blend could cover, but the old state's contexts have no `q33..q64` / `t9..t16`
-to blend, and detection never produces MD2, so it falls under the same rule (hard cut).
+The mode's own preset blends run both presets inside one mode's pipeline (one mesh, one set of contexts), so they
+cannot span a mode change: the running preset's contexts (dialect, `q33..q64`, `t9..t16`), its audio analysis and
+the per-frame frame builder all follow the one engine-wide mode, and the audio analyser and the EEL memory are
+single objects. projectM's image-space transition does not need any of that shared state — each slot renders
+through its own renderer and a transition shader cross-fades the two finished images — so the MilkDrop 2 / 3 pair
+uses it, with the MD3 `_mxd3q*` inputs stepping for the incoming state while the outgoing preset of the old mode
+reads none of them. Involving projectM stays a hard cut: its renderer rules differ on the frame-builder inputs the
+old renderer would have to accept mid-transition.
 
 **Determinism.** The mode is a function of the preset bytes and the current mode; every random stream is seeded
 from `EngineConfig::seed` and survives the switch (one `rand()` stream, one set of transition / blend streams), so the
@@ -185,9 +190,10 @@ use.
   `q330` / `q65` / `q033` / `q32`, `t17`, members, number literals, declared names, `#define`, incomplete `.milk2`
   markers, other versions).
 - `crates/lactea/tests/auto_compat.rs` (GPU): a playlist projectM -> MD3 `q40` preset -> MD3 sprite preset -> `.milk2` ->
-  projectM -> projectM through one engine (resolved mode, the hard cut on a mode change, the soft cuts that stay,
+  projectM -> projectM through one engine (resolved mode, the hard cut on a projectM mode change, the soft cuts that stay,
   the double preset ending, no validation error), a failed load that keeps the mode, an engine configured as MD2
-  resolving its first preset, a fixed engine never switching, determinism.
+  resolving its first preset, a fixed engine never switching, determinism, and the MD2 <-> MD3 soft cut blending
+  across the mode change (the `.milk2` incoming staying a hard cut).
 - Fixed-mode equivalence: `fdrender` frames 0..29 (160x90) of 4 presets (2 corpus, 2 pack) x `projectm` / `md2` /
   `md3`: 12 SHA-256 digests of the PNG streams equal before and after.
 - Smoke, `fdrender --compat auto --frames 30` (160x90):
